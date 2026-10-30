@@ -7,9 +7,17 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:usb_serial/usb_serial.dart';
 
+import 'tcp_transport.dart';
+
 void main() => runApp(const PhoneCommApp());
 
 const _fileChannel = MethodChannel('phone_comm/files');
+
+enum _ConnectionMode { usb, server, client }
+
+const _ink = Color(0xFF18324B);
+const _linkBlue = Color(0xFF1765C1);
+const _connectedGreen = Color(0xFF16846B);
 
 Uint8List parseHex(String input) {
   final value = input.replaceAll(RegExp(r'\s+'), '');
@@ -146,8 +154,34 @@ class PhoneCommApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => MaterialApp(
-        title: '串口调试助手',
-        theme: ThemeData(primarySwatch: Colors.blue),
+        title: 'PhoneComm 通信助手',
+        debugShowCheckedModeBanner: false,
+        theme: ThemeData(
+          primarySwatch: Colors.blue,
+          primaryColor: _linkBlue,
+          colorScheme: const ColorScheme.light(
+              primary: _linkBlue, secondary: _connectedGreen, onSurface: _ink),
+          scaffoldBackgroundColor: const Color(0xFFF3F6FA),
+          appBarTheme: const AppBarTheme(
+              backgroundColor: Colors.white,
+              foregroundColor: _ink,
+              elevation: 0),
+          elevatedButtonTheme: ElevatedButtonThemeData(
+              style: ElevatedButton.styleFrom(
+                  minimumSize: const Size(88, 48), elevation: 0)),
+          outlinedButtonTheme: OutlinedButtonThemeData(
+              style: OutlinedButton.styleFrom(minimumSize: const Size(72, 48))),
+          inputDecorationTheme: const InputDecorationTheme(
+              contentPadding:
+                  EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+              border: OutlineInputBorder()),
+          cardTheme: const CardTheme(elevation: 0),
+          chipTheme: ChipThemeData.fromDefaults(
+            primaryColor: _linkBlue,
+            secondaryColor: const Color(0xFFD8E8FC),
+            labelStyle: const TextStyle(fontSize: 13, color: _ink),
+          ).copyWith(backgroundColor: const Color(0xFFF0F3F7)),
+        ),
         home: const SerialPage(),
       );
 }
@@ -161,6 +195,9 @@ class SerialPage extends StatefulWidget {
 
 class _SerialPageState extends State<SerialPage> {
   final _sendController = TextEditingController();
+  final _sendFocusNode = FocusNode();
+  final _hostController = TextEditingController();
+  final _tcpPortController = TextEditingController(text: '9000');
   final _periodController = TextEditingController(text: '1000');
   final _logScrollController = ScrollController();
   final _entries = <_LogEntry>[];
@@ -168,6 +205,11 @@ class _SerialPageState extends State<SerialPage> {
   List<UsbDevice> _devices = [];
   UsbDevice? _selectedDevice;
   UsbPort? _port;
+  late final TcpTransport _tcp;
+  bool _tcpWasConnected = false;
+  _ConnectionMode _mode = _ConnectionMode.usb;
+  List<String> _localAddresses = [];
+  String? _networkError;
   StreamSubscription<Uint8List>? _receiveSubscription;
   StreamSubscription<UsbEvent>? _usbSubscription;
   String? _connectedDeviceName;
@@ -203,11 +245,29 @@ class _SerialPageState extends State<SerialPage> {
   Timer? _refreshTimer;
   Timer? _repeatTimer;
 
+  bool get _connected =>
+      _mode == _ConnectionMode.usb ? _port != null : _tcp.isConnected;
+
+  bool get _active => _connected || _tcp.isListening;
+
   @override
   void initState() {
     super.initState();
+    _tcp = TcpTransport(
+        onData: _onReceived,
+        onStateChanged: (message) {
+          if (!mounted || _mode == _ConnectionMode.usb) return;
+          if (_tcpWasConnected && !_tcp.isConnected) {
+            ++_generation;
+            _stopRepeat();
+          }
+          _tcpWasConnected = _tcp.isConnected;
+          setState(() => _status = message);
+          _record(_LogEntry('SYS', DateTime.now(), message: message));
+        });
     _usbSubscription = UsbSerial.usbEventStream?.listen((event) {
-      if (event.event == UsbEvent.ACTION_USB_DETACHED &&
+      if (_mode == _ConnectionMode.usb &&
+          event.event == UsbEvent.ACTION_USB_DETACHED &&
           event.device?.deviceName == _selectedDevice?.deviceName) {
         _disconnect('设备已拔出');
       }
@@ -306,6 +366,8 @@ class _SerialPageState extends State<SerialPage> {
     _port = null;
     _receiveSubscription = null;
     _connectedDeviceName = null;
+    _tcpWasConnected = false;
+    final closingTcp = _tcp.close();
     if (mounted) {
       setState(() {
         _busy = false;
@@ -314,6 +376,7 @@ class _SerialPageState extends State<SerialPage> {
       _record(_LogEntry('SYS', DateTime.now(), message: message));
     }
     await subscription?.cancel();
+    await closingTcp;
     if (port != null) {
       try {
         await port.close();
@@ -323,9 +386,89 @@ class _SerialPageState extends State<SerialPage> {
     }
   }
 
+  void _selectMode(_ConnectionMode mode) {
+    if (_mode == mode) return;
+    FocusScope.of(context).unfocus();
+    _disconnect();
+    setState(() {
+      _mode = mode;
+      _networkError = null;
+      _status = mode == _ConnectionMode.usb
+          ? '请选择 USB 设备并打开串口'
+          : mode == _ConnectionMode.server
+              ? '设置端口后开始监听，等待远端连接'
+              : '输入远端地址和端口后连接';
+    });
+    if (mode == _ConnectionMode.server) _refreshAddresses();
+  }
+
+  Future<void> _refreshAddresses() async {
+    try {
+      final interfaces =
+          await NetworkInterface.list(type: InternetAddressType.IPv4);
+      if (!mounted) return;
+      setState(() => _localAddresses = interfaces
+          .expand((interface) => interface.addresses)
+          .map((address) => address.address)
+          .toSet()
+          .toList());
+    } catch (error) {
+      _showError('获取本机地址失败：$error');
+    }
+  }
+
+  Future<void> _connectNetwork() async {
+    final port = int.tryParse(_tcpPortController.text.trim());
+    final host = _hostController.text.trim();
+    if (port == null ||
+        port < 1 ||
+        port > 65535 ||
+        (_mode == _ConnectionMode.client &&
+            (host.isEmpty || RegExp(r'\s|://|/').hasMatch(host)))) {
+      setState(() => _networkError = port == null || port < 1 || port > 65535
+          ? '端口请输入 1–65535 的整数'
+          : '请输入 IP 地址或域名，不含协议和路径');
+      return;
+    }
+    FocusScope.of(context).unfocus();
+    final generation = ++_generation;
+    setState(() {
+      _busy = true;
+      _networkError = null;
+      _status =
+          _mode == _ConnectionMode.server ? '正在启动监听…' : '正在连接 $host:$port…';
+    });
+    try {
+      if (_mode == _ConnectionMode.server) {
+        await _tcp.listen(port);
+      } else {
+        await _tcp.connect(host, port);
+      }
+    } catch (error) {
+      if (mounted && generation == _generation) {
+        setState(() => _networkError = '连接失败：$error');
+        _showError('连接失败：$error');
+      }
+    } finally {
+      if (mounted && generation == _generation) {
+        setState(() => _busy = false);
+      }
+    }
+  }
+
+  Future<void> _write(Uint8List bytes) async {
+    if (_mode == _ConnectionMode.usb) {
+      final port = _port;
+      if (port == null) throw StateError('串口已断开');
+      await port.write(bytes);
+    } else {
+      await _tcp.write(bytes);
+    }
+  }
+
   Future<void> _send() async {
-    final port = _port;
-    if (port == null || _sending) return;
+    if (!_connected || _sending) return;
+    final generation = _generation;
     try {
       final input = _sendController.text;
       final payload = input.isEmpty
@@ -343,7 +486,8 @@ class _SerialPageState extends State<SerialPage> {
       final bytes = Uint8List.fromList([...payload, ...utf8.encode(suffix)]);
       if (bytes.isEmpty) return;
       setState(() => _sending = true);
-      await port.write(bytes);
+      await _write(bytes);
+      if (generation != _generation || !mounted) return;
       _txBytes += bytes.length;
       _record(_LogEntry('TX', DateTime.now(), data: bytes));
       if (input.isNotEmpty) {
@@ -353,8 +497,10 @@ class _SerialPageState extends State<SerialPage> {
         if (_history.length > 20) _history.removeLast();
       }
     } catch (error) {
-      _showError('发送失败：$error');
-      _stopRepeat();
+      if (generation == _generation) {
+        _showError('发送失败：$error');
+        _stopRepeat();
+      }
     } finally {
       if (mounted) setState(() => _sending = false);
     }
@@ -434,8 +580,8 @@ class _SerialPageState extends State<SerialPage> {
       _showError('定时间隔请输入 100–60000 毫秒');
       return;
     }
-    if (_port == null) {
-      _showError('请先连接串口');
+    if (!_connected) {
+      _showError('请先建立通信连接');
       return;
     }
     setState(() => _repeat = true);
@@ -445,28 +591,36 @@ class _SerialPageState extends State<SerialPage> {
   }
 
   Future<void> _sendFile() async {
-    final port = _port;
-    if (port == null || _sending) return;
+    if (!_connected || _sending) return;
+    final generation = _generation;
     _stopRepeat();
     String? path;
     RandomAccessFile? source;
     try {
       path = await _fileChannel.invokeMethod<String>('pickFile');
-      if (path == null || !mounted || _port != port) return;
+      if (path == null ||
+          !mounted ||
+          generation != _generation ||
+          !_connected) {
+        return;
+      }
       setState(() {
         _sending = true;
         _status = '正在发送文件…';
       });
       source = await File(path).open();
-      final generation = _generation;
       var sent = 0;
       while (true) {
-        if (generation != _generation || _port != port) {
-          throw StateError('串口已断开');
+        if (generation != _generation || !_connected) {
+          throw StateError('通信连接已断开');
         }
         final chunk = await source.read(4096);
+        if (generation != _generation || !_connected) {
+          throw StateError('通信连接已断开');
+        }
         if (chunk.isEmpty) break;
-        await port.write(Uint8List.fromList(chunk));
+        await _write(Uint8List.fromList(chunk));
+        if (generation != _generation) throw StateError('通信连接已断开');
         sent += chunk.length;
         _txBytes += chunk.length;
         _status = '正在发送文件：$sent 字节';
@@ -475,7 +629,7 @@ class _SerialPageState extends State<SerialPage> {
       _record(_LogEntry('SYS', DateTime.now(), message: '文件发送完成：$sent 字节'));
       if (mounted) setState(() => _status = '文件发送完成：$sent 字节');
     } catch (error) {
-      _showError('文件发送失败：$error');
+      if (generation == _generation) _showError('文件发送失败：$error');
     } finally {
       try {
         await source?.close();
@@ -660,7 +814,11 @@ class _SerialPageState extends State<SerialPage> {
     _usbSubscription?.cancel();
     _receiveSubscription?.cancel();
     _port?.close();
+    _tcp.close();
     _sendController.dispose();
+    _sendFocusNode.dispose();
+    _hostController.dispose();
+    _tcpPortController.dispose();
     _periodController.dispose();
     _logScrollController.dispose();
     super.dispose();
@@ -706,58 +864,66 @@ class _SerialPageState extends State<SerialPage> {
               child: ListView(
                 padding: const EdgeInsets.all(20),
                 children: [
-                  const Text('串口设置',
-                      style:
-                          TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
-                  const SizedBox(height: 8),
-                  if (!editable)
-                    const Text('修改串口参数前请先断开连接',
-                        style: TextStyle(color: Colors.orange)),
-                  Row(children: [
-                    Expanded(
-                      child: _settingDropdown(
-                          '数据位',
-                          _dataBits,
-                          const {5: '5', 6: '6', 7: '7', 8: '8'},
-                          editable,
-                          (value) => update(() => _dataBits = value)),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: _settingDropdown(
-                          '停止位',
-                          _stopBits,
-                          const {1: '1', 3: '1.5', 2: '2'},
-                          editable,
-                          (value) => update(() => _stopBits = value)),
-                    ),
-                  ]),
-                  const SizedBox(height: 8),
-                  Row(children: [
-                    Expanded(
-                      child: _settingDropdown(
-                          '校验位',
-                          _parity,
-                          const {0: '无', 1: '奇', 2: '偶', 3: 'Mark', 4: 'Space'},
-                          editable,
-                          (value) => update(() => _parity = value)),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: _settingDropdown(
-                          '流控',
-                          _flowControl,
-                          const {
-                            0: '无',
-                            1: 'RTS/CTS',
-                            2: 'DTR/DSR',
-                            3: 'XON/XOFF'
-                          },
-                          editable,
-                          (value) => update(() => _flowControl = value)),
-                    ),
-                  ]),
-                  const Divider(height: 32),
+                  if (_mode == _ConnectionMode.usb) ...[
+                    const Text('串口设置',
+                        style: TextStyle(
+                            fontSize: 20, fontWeight: FontWeight.bold)),
+                    const SizedBox(height: 8),
+                    if (!editable)
+                      const Text('修改串口参数前请先断开连接',
+                          style: TextStyle(color: Colors.orange)),
+                    Row(children: [
+                      Expanded(
+                        child: _settingDropdown(
+                            '数据位',
+                            _dataBits,
+                            const {5: '5', 6: '6', 7: '7', 8: '8'},
+                            editable,
+                            (value) => update(() => _dataBits = value)),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: _settingDropdown(
+                            '停止位',
+                            _stopBits,
+                            const {1: '1', 3: '1.5', 2: '2'},
+                            editable,
+                            (value) => update(() => _stopBits = value)),
+                      ),
+                    ]),
+                    const SizedBox(height: 8),
+                    Row(children: [
+                      Expanded(
+                        child: _settingDropdown(
+                            '校验位',
+                            _parity,
+                            const {
+                              0: '无',
+                              1: '奇',
+                              2: '偶',
+                              3: 'Mark',
+                              4: 'Space'
+                            },
+                            editable,
+                            (value) => update(() => _parity = value)),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: _settingDropdown(
+                            '流控',
+                            _flowControl,
+                            const {
+                              0: '无',
+                              1: 'RTS/CTS',
+                              2: 'DTR/DSR',
+                              3: 'XON/XOFF'
+                            },
+                            editable,
+                            (value) => update(() => _flowControl = value)),
+                      ),
+                    ]),
+                    const Divider(height: 32),
+                  ],
                   const Text('接收设置',
                       style:
                           TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
@@ -821,6 +987,165 @@ class _SerialPageState extends State<SerialPage> {
     );
   }
 
+  Widget _modeSelector() => Material(
+        color: Colors.white,
+        child: Row(
+          children: _ConnectionMode.values.map((mode) {
+            final selected = _mode == mode;
+            final label = const ['USB 串口', 'TCP 服务端', 'TCP 客户端'][mode.index];
+            return Expanded(
+              child: Semantics(
+                selected: selected,
+                button: true,
+                child: InkWell(
+                  key: ValueKey('mode-${mode.name}'),
+                  onTap: () => _selectMode(mode),
+                  child: Container(
+                    constraints: const BoxConstraints(minHeight: 58),
+                    decoration: BoxDecoration(
+                      color: selected ? const Color(0xFFE9F1FC) : null,
+                      border: Border(
+                          bottom: BorderSide(
+                              width: 3,
+                              color:
+                                  selected ? _linkBlue : Colors.transparent)),
+                    ),
+                    child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Icon(
+                              const [
+                                Icons.usb,
+                                Icons.router,
+                                Icons.lan
+                              ][mode.index],
+                              size: 19,
+                              color: selected ? _linkBlue : _ink),
+                          const SizedBox(height: 3),
+                          Text(label,
+                              style: TextStyle(
+                                  fontSize: 13,
+                                  fontWeight: selected
+                                      ? FontWeight.w600
+                                      : FontWeight.normal,
+                                  color: selected ? _linkBlue : _ink)),
+                        ]),
+                  ),
+                ),
+              ),
+            );
+          }).toList(),
+        ),
+      );
+
+  Widget _networkPanel() {
+    final server = _mode == _ConnectionMode.server;
+    final enabled = !_active && !_busy;
+    final state = _connected
+        ? '已连接'
+        : _tcp.isListening
+            ? '等待接入'
+            : '未连接';
+    return Container(
+      margin: const EdgeInsets.fromLTRB(12, 12, 12, 8),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: const Color(0xFFDCE5EF))),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          Text(server ? '等待远端接入' : '连接远端设备',
+              style: const TextStyle(
+                  fontSize: 16, fontWeight: FontWeight.w600, color: _ink)),
+          const Spacer(),
+          Icon(Icons.circle,
+              size: 8,
+              color: _connected
+                  ? _connectedGreen
+                  : _tcp.isListening
+                      ? const Color(0xFFB56A12)
+                      : Colors.grey),
+          const SizedBox(width: 6),
+          Text(state,
+              style: TextStyle(
+                  fontSize: 12, color: _connected ? _connectedGreen : _ink)),
+        ]),
+        const SizedBox(height: 12),
+        if (!server) ...[
+          TextField(
+            key: const ValueKey('tcp-host'),
+            controller: _hostController,
+            enabled: enabled,
+            keyboardType: TextInputType.url,
+            autocorrect: false,
+            decoration: const InputDecoration(
+                labelText: '远端 IP / 域名', hintText: '例如 192.168.1.10'),
+          ),
+          const SizedBox(height: 12),
+        ],
+        Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Expanded(
+              child: TextField(
+            key: const ValueKey('tcp-port'),
+            controller: _tcpPortController,
+            enabled: enabled,
+            keyboardType: TextInputType.number,
+            inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+            decoration: InputDecoration(labelText: server ? '监听端口' : '远端端口'),
+            onSubmitted: (_) => enabled ? _connectNetwork() : null,
+          )),
+          const SizedBox(width: 12),
+          ElevatedButton.icon(
+            key: const ValueKey('network-connect'),
+            onPressed: () =>
+                _active || _busy ? _disconnect() : _connectNetwork(),
+            icon: Icon(
+                _active || _busy
+                    ? Icons.stop
+                    : server
+                        ? Icons.wifi_tethering
+                        : Icons.link,
+                size: 18),
+            label: Text(_busy
+                ? '取消'
+                : server
+                    ? (_active ? '停止监听' : '开始监听')
+                    : (_active ? '断开' : '连接')),
+          ),
+        ]),
+        if (_networkError != null)
+          Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Text(_networkError!,
+                  style:
+                      const TextStyle(color: Color(0xFFB3261E), fontSize: 12))),
+        if (server)
+          Row(children: [
+            Expanded(
+                child: SelectableText(
+                    _localAddresses.isEmpty
+                        ? '暂无本机 IPv4，请检查 Wi-Fi 或热点'
+                        : '本机 IPv4：${_localAddresses.join(' / ')}',
+                    style: const TextStyle(fontSize: 12, color: _ink))),
+            IconButton(
+                tooltip: '刷新本机地址',
+                onPressed: _refreshAddresses,
+                icon: const Icon(Icons.refresh, size: 20)),
+          ])
+        else
+          const SizedBox(height: 8),
+        Text(
+            _tcp.peer != null
+                ? '对端 ${_tcp.peer}'
+                : server
+                    ? '单客户端接入；断开后继续等待'
+                    : '连接成功后可发送文本、HEX 或文件',
+            style: const TextStyle(fontSize: 12, color: Color(0xFF52677A))),
+      ]),
+    );
+  }
+
   Widget _connectionPanel() => Card(
         margin: const EdgeInsets.fromLTRB(12, 12, 12, 8),
         child: Padding(
@@ -862,6 +1187,7 @@ class _SerialPageState extends State<SerialPage> {
                   onPressed: _busy ? null : _scanDevices,
                   icon: const Icon(Icons.refresh)),
             ]),
+            const SizedBox(height: 10),
             Row(children: [
               Expanded(
                 child: DropdownButtonFormField<int>(
@@ -972,7 +1298,8 @@ class _SerialPageState extends State<SerialPage> {
         ),
         child: visibleEntries.isEmpty
             ? const Center(
-                child: Text('等待串口数据…', style: TextStyle(color: Colors.grey)))
+                child:
+                    Text('连接后在此查看收发数据', style: TextStyle(color: Colors.grey)))
             : ListView.builder(
                 controller: _logScrollController,
                 itemCount: visibleEntries.length,
@@ -1028,12 +1355,14 @@ class _SerialPageState extends State<SerialPage> {
             ),
             IconButton(
               tooltip: '发送文件',
-              onPressed: _port == null || _sending ? null : _sendFile,
+              onPressed: !_connected || _sending ? null : _sendFile,
               icon: const Icon(Icons.attach_file),
             ),
           ]),
           TextField(
+            key: const ValueKey('send-input'),
             controller: _sendController,
+            focusNode: _sendFocusNode,
             minLines: 1,
             maxLines: 2,
             decoration: InputDecoration(
@@ -1048,13 +1377,14 @@ class _SerialPageState extends State<SerialPage> {
                 style: const TextStyle(fontSize: 12, color: Colors.grey)),
             const Spacer(),
             OutlinedButton.icon(
-              onPressed: _port == null ? null : _toggleRepeat,
+              onPressed:
+                  !_connected || (_sending && !_repeat) ? null : _toggleRepeat,
               icon: Icon(_repeat ? Icons.stop : Icons.timer, size: 18),
               label: Text(_repeat ? '停止定时' : '定时'),
             ),
             const SizedBox(width: 8),
             ElevatedButton.icon(
-              onPressed: _port == null || _sending ? null : _send,
+              onPressed: !_connected || _sending ? null : _send,
               icon: const Icon(Icons.send, size: 18),
               label: const Text('发送'),
             ),
@@ -1065,10 +1395,12 @@ class _SerialPageState extends State<SerialPage> {
   @override
   Widget build(BuildContext context) {
     final keyboardOpen = MediaQuery.of(context).viewInsets.bottom > 0;
+    final editingMessage = keyboardOpen && _sendFocusNode.hasFocus;
     return Scaffold(
       backgroundColor: const Color(0xFFF3F6FA),
       appBar: AppBar(
-        title: const Text('串口调试助手'),
+        title: const Text('PhoneComm',
+            style: TextStyle(fontWeight: FontWeight.w700, letterSpacing: -0.5)),
         actions: [
           IconButton(
               tooltip: '更多设置',
@@ -1080,114 +1412,135 @@ class _SerialPageState extends State<SerialPage> {
         ],
       ),
       body: SafeArea(
-        child: Column(children: [
-          if (!keyboardOpen) _connectionPanel(),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 2, 8, 4),
-            child: Column(children: [
-              Row(children: [
-                const Text('数据日志',
-                    style:
-                        TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-                const Spacer(),
-                IconButton(
-                    tooltip: _showTime ? '隐藏界面时间戳' : '显示界面时间戳',
-                    onPressed: () => setState(() => _showTime = !_showTime),
-                    color: _showTime ? Colors.blue : Colors.grey,
-                    icon: const Icon(Icons.access_time)),
-                IconButton(
-                    tooltip: _autoScroll ? '关闭自动滚屏' : '开启自动滚屏',
-                    onPressed: () {
-                      setState(() => _autoScroll = !_autoScroll);
-                      if (_autoScroll) _scrollToLatest();
-                    },
-                    icon: Icon(_autoScroll
-                        ? Icons.vertical_align_bottom
-                        : Icons.pause_circle_outline)),
-                IconButton(
-                    tooltip: _recording ? '停止实时记录' : '开始实时记录',
-                    onPressed: _recordBusy ? null : _toggleRecording,
-                    color: _recording ? Colors.red : null,
-                    icon: Icon(_recording
-                        ? Icons.stop_circle_outlined
-                        : Icons.fiber_manual_record_outlined)),
-                PopupMenuButton<String>(
-                  tooltip: '日志操作',
-                  icon: const Icon(Icons.more_vert),
-                  onSelected: (action) {
-                    if (action == 'save') {
-                      _saveLog();
-                    } else if (action == 'append') {
-                      _appendRecentToRecording();
-                    } else if (action == 'clear') {
-                      setState(_entries.clear);
-                    }
-                  },
-                  itemBuilder: (_) => [
-                    PopupMenuItem(
-                        value: 'save',
-                        enabled: _entries.isNotEmpty,
-                        child: const Text('导出最近800条到文件')),
-                    PopupMenuItem(
-                        value: 'append',
-                        enabled: _recording && _entries.isNotEmpty,
-                        child: const Text('追加最近800条到记录文件')),
-                    const PopupMenuItem(value: 'clear', child: Text('清除日志')),
-                  ],
+        child: LayoutBuilder(builder: (context, constraints) {
+          // 横屏或键盘占满屏幕时，允许滚动到连接与发送控件。
+          final minimumHeight =
+              keyboardOpen ? (editingMessage ? 300.0 : 420.0) : 680.0;
+          return SingleChildScrollView(
+            child: SizedBox(
+              height: constraints.maxHeight < minimumHeight
+                  ? minimumHeight
+                  : constraints.maxHeight,
+              child: Column(children: [
+                if (!editingMessage) _modeSelector(),
+                if (!editingMessage)
+                  _mode == _ConnectionMode.usb
+                      ? _connectionPanel()
+                      : _networkPanel(),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 2, 8, 4),
+                  child: Column(children: [
+                    Row(children: [
+                      const Text('数据日志',
+                          style: TextStyle(
+                              fontSize: 16, fontWeight: FontWeight.bold)),
+                      const Spacer(),
+                      IconButton(
+                          tooltip: _showTime ? '隐藏界面时间戳' : '显示界面时间戳',
+                          onPressed: () =>
+                              setState(() => _showTime = !_showTime),
+                          color: _showTime ? Colors.blue : Colors.grey,
+                          icon: const Icon(Icons.access_time)),
+                      IconButton(
+                          tooltip: _autoScroll ? '关闭自动滚屏' : '开启自动滚屏',
+                          onPressed: () {
+                            setState(() => _autoScroll = !_autoScroll);
+                            if (_autoScroll) _scrollToLatest();
+                          },
+                          icon: Icon(_autoScroll
+                              ? Icons.vertical_align_bottom
+                              : Icons.pause_circle_outline)),
+                      IconButton(
+                          tooltip: _recording ? '停止实时记录' : '开始实时记录',
+                          onPressed: _recordBusy ? null : _toggleRecording,
+                          color: _recording ? Colors.red : null,
+                          icon: Icon(_recording
+                              ? Icons.stop_circle_outlined
+                              : Icons.fiber_manual_record_outlined)),
+                      PopupMenuButton<String>(
+                        tooltip: '日志操作',
+                        icon: const Icon(Icons.more_vert),
+                        onSelected: (action) {
+                          if (action == 'save') {
+                            _saveLog();
+                          } else if (action == 'append') {
+                            _appendRecentToRecording();
+                          } else if (action == 'clear') {
+                            setState(_entries.clear);
+                          }
+                        },
+                        itemBuilder: (_) => [
+                          PopupMenuItem(
+                              value: 'save',
+                              enabled: _entries.isNotEmpty,
+                              child: const Text('导出最近800条到文件')),
+                          PopupMenuItem(
+                              value: 'append',
+                              enabled: _recording && _entries.isNotEmpty,
+                              child: const Text('追加最近800条到记录文件')),
+                          const PopupMenuItem(
+                              value: 'clear', child: Text('清除日志')),
+                        ],
+                      ),
+                    ]),
+                    Row(children: [
+                      if (_recording)
+                        Expanded(
+                          child: Text('● 正在记录 $_recordName',
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                  color: Colors.red, fontSize: 12)),
+                        )
+                      else
+                        const Spacer(),
+                      ChoiceChip(
+                        label: const Text('ASCII'),
+                        selected: !_hexReceive,
+                        onSelected: (_) => setState(() => _hexReceive = false),
+                      ),
+                      const SizedBox(width: 6),
+                      ChoiceChip(
+                        label: const Text('HEX'),
+                        selected: _hexReceive,
+                        onSelected: (_) => setState(() => _hexReceive = true),
+                      ),
+                    ]),
+                  ]),
                 ),
-              ]),
-              Row(children: [
-                if (_recording)
-                  Expanded(
-                    child: Text('● 正在记录 $_recordName',
-                        overflow: TextOverflow.ellipsis,
-                        style:
-                            const TextStyle(color: Colors.red, fontSize: 12)),
-                  )
-                else
-                  const Spacer(),
-                ChoiceChip(
-                  label: const Text('ASCII'),
-                  selected: !_hexReceive,
-                  onSelected: (_) => setState(() => _hexReceive = false),
-                ),
-                const SizedBox(width: 6),
-                ChoiceChip(
-                  label: const Text('HEX'),
-                  selected: _hexReceive,
-                  onSelected: (_) => setState(() => _hexReceive = true),
-                ),
-              ]),
-            ]),
-          ),
-          _logPanel(),
-          _composer(),
-          if (!keyboardOpen)
-            Container(
-              height: 38,
-              padding: const EdgeInsets.only(left: 12),
-              color: const Color(0xFFE6EDF5),
-              child: Row(children: [
-                Expanded(
-                    child: Text(_status,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(fontSize: 12))),
-                Text('RX:$_rxBytes  TX:$_txBytes',
-                    style:
-                        const TextStyle(fontSize: 12, fontFamily: 'monospace')),
-                IconButton(
-                    tooltip: '计数清零',
-                    padding: EdgeInsets.zero,
-                    iconSize: 18,
-                    onPressed: () => setState(() {
-                          _rxBytes = 0;
-                          _txBytes = 0;
-                        }),
-                    icon: const Icon(Icons.restart_alt)),
+                _logPanel(),
+                Offstage(
+                    key: const ValueKey('composer-visibility'),
+                    offstage: keyboardOpen && !editingMessage,
+                    child: _composer()),
+                if (!keyboardOpen)
+                  Container(
+                    height: 38,
+                    padding: const EdgeInsets.only(left: 12),
+                    color: const Color(0xFFE6EDF5),
+                    child: Row(children: [
+                      Expanded(
+                          child: Text(_status,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(fontSize: 12))),
+                      Text('RX:$_rxBytes  TX:$_txBytes',
+                          style: const TextStyle(
+                              fontSize: 12, fontFamily: 'monospace')),
+                      IconButton(
+                          tooltip: '计数清零',
+                          padding: EdgeInsets.zero,
+                          iconSize: 18,
+                          onPressed: () => setState(() {
+                                _rxBytes = 0;
+                                _txBytes = 0;
+                              }),
+                          icon: const Icon(Icons.restart_alt)),
+                    ]),
+                  ),
               ]),
             ),
-        ]),
+          );
+        }),
       ),
     );
   }
